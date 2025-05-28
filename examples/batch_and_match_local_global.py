@@ -95,6 +95,32 @@ def posterior_log_prob(x, mu_x, sigma_x, sigma_y, y):
     return posterior.log_prob(x)
 
 
+class _SafeLog(torch.autograd.Function):
+    '''Numerically stable log function that avoids infinite gradients at log(0) by clamping them to at most 1 / finfo.eps
+    
+    Notes:
+    -----
+    https://github.com/pyro-ppl/pyro/blob/1a11185ce54a2391348bec5919f3330d957d2f98/pyro/ops/special.py#L15C1-L24C60
+    '''
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x.log()
+
+    @staticmethod
+    def backward(ctx, grad):
+        (x,) = ctx.saved_tensors
+        return grad / x.clamp(min=torch.finfo(x.dtype).eps)
+    
+
+def safe_log(x):
+    """
+    Like :func:`torch.log` but avoids infinite gradients at log(0)
+    by clamping them to at most ``1 / finfo.eps``.
+    """
+    return _SafeLog.apply(x)
+
+
 def score(z, sigma_y_gt, y_observed, n_monte_carlo_samples):
     log_sigma_x_estimate = z
     log_sigma_x_estimate.requires_grad = True  
@@ -104,7 +130,7 @@ def score(z, sigma_y_gt, y_observed, n_monte_carlo_samples):
     log_prob = 0
     for y in y_observed:
         x_hidden_sample_thorugh, _ = simulator(mu_x_estimate, sigma_x_estimate, sigma_y_gt, n_samples=n_monte_carlo_samples)
-        log_prob += posterior_log_prob(x_hidden_sample_thorugh, mu_x_estimate, sigma_x_estimate, sigma_y_gt, y).sum()
+        log_prob += safe_log(posterior_log_prob(x_hidden_sample_thorugh, mu_x_estimate, sigma_x_estimate, sigma_y_gt, y).exp().mean())
 
     log_prob.backward()
 
@@ -127,7 +153,7 @@ def batch_and_match_vi(T, B, mu_0, Sigma_0, y_observed, sigma_y_gt, n_monte_carl
             g_b = score(z_b, sigma_y_gt, y_observed, n_monte_carlo_samples)
             g_z[idx] = g_b
 
-        lambda_t = T / (t + 1)
+        lambda_t = 10 #T / (t + 1)
         mean_new, cov_new = bam_update(samples, g_z, mu_t, Sigma_t, lambda_t)
         cov_new += torch.eye(D) * jitter
         cov_new = (cov_new + cov_new.T)/2.
@@ -136,7 +162,7 @@ def batch_and_match_vi(T, B, mu_0, Sigma_0, y_observed, sigma_y_gt, n_monte_carl
             mu_t, Sigma_t = mean_new, cov_new
         else:
             print("Bad update for covariance matrix. Revert")
-        if t % 10 == 0:
+        if t % 1 == 0:
             print(f"Iteration {t}:")
             print("mean:", mu_t)
             print("cov:", Sigma_t)
@@ -167,8 +193,6 @@ def mle_sigma_x2_and_std_known_sigma(y, mu_x, sigma_x, sigma_y):
     return sigma_x2_hat, var_of_estimate.sqrt()
 
 
-
-
 def run(n_samples, T, B,  n_monte_carlo_samples):
     mu_x_gt = torch.tensor([0.0])
     sigma_x_gt = torch.tensor([1.0])
@@ -178,7 +202,7 @@ def run(n_samples, T, B,  n_monte_carlo_samples):
     mu_T, Sigma_T = batch_and_match_vi(T=T, 
                                        B=B, 
                                        mu_0=torch.log(sigma_x_gt * 2), 
-                                       Sigma_0=torch.eye(d)*3,
+                                       Sigma_0=torch.eye(d),
                                        y_observed=y_observed,
                                        sigma_y_gt=sigma_y_gt,
                                        n_monte_carlo_samples=n_monte_carlo_samples,
@@ -194,11 +218,11 @@ def run(n_samples, T, B,  n_monte_carlo_samples):
 
 def main():
     torch.manual_seed(0)
-    T = 3
-    B = 30
-    n_monte_carlo_samples = 300
-    trials = 30
-    list_of_n_samples = [3, 10, 30, 100, 300, 1000]
+    T = 20
+    B = 100
+    n_monte_carlo_samples = 1000
+    trials = 5
+    list_of_n_samples = [100 ]
     bam_estimates_of_sigma_x = torch.zeros(trials, len(list_of_n_samples))
     mle_estimates_of_sigma_x = torch.zeros(trials, len(list_of_n_samples))
     std_estimates_of_sigma_x = torch.zeros(trials, len(list_of_n_samples))
@@ -214,7 +238,10 @@ def main():
         "bam_estimates_of_sigma_x": bam_estimates_of_sigma_x,
         "mle_estimates_of_sigma_x": mle_estimates_of_sigma_x,
         "std_estimates_of_sigma_x": std_estimates_of_sigma_x,
-    }, "estimates_of_sigma_x.pt")
+        "batch_size": B,
+        "n_monte_carlo_samples": n_monte_carlo_samples,
+        "T": T
+    }, f"estimates_of_sigma_x_batchsize{B}_T{T}_n-monte-carlo{n_monte_carlo_samples}_trials{trials}.pt")
 
 if __name__ == "__main__":
     main()
