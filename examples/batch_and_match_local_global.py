@@ -95,7 +95,7 @@ def posterior_log_prob(x, mu_x, sigma_x, sigma_y, y):
     return posterior.log_prob(x)
 
 
-def score(z, sigma_y_gt, y_observed, n_mcmc_samples):
+def score(z, sigma_y_gt, y_observed, n_monte_carlo_samples):
     log_sigma_x_estimate = z
     log_sigma_x_estimate.requires_grad = True  
     sigma_x_estimate = torch.exp(log_sigma_x_estimate)
@@ -103,7 +103,7 @@ def score(z, sigma_y_gt, y_observed, n_mcmc_samples):
 
     log_prob = 0
     for y in y_observed:
-        x_hidden_sample_thorugh, _ = simulator(mu_x_estimate, sigma_x_estimate, sigma_y_gt, n_samples=n_mcmc_samples)
+        x_hidden_sample_thorugh, _ = simulator(mu_x_estimate, sigma_x_estimate, sigma_y_gt, n_samples=n_monte_carlo_samples)
         log_prob += posterior_log_prob(x_hidden_sample_thorugh, mu_x_estimate, sigma_x_estimate, sigma_y_gt, y).sum()
 
     log_prob.backward()
@@ -111,9 +111,9 @@ def score(z, sigma_y_gt, y_observed, n_mcmc_samples):
     return log_sigma_x_estimate.grad
 
 
-def batch_and_match_vi(T, B, mu_0, Sigma_0, y_observed, sigma_y_gt, n_mcmc_samples, jitter):
+def batch_and_match_vi(T, B, mu_0, Sigma_0, y_observed, sigma_y_gt, n_monte_carlo_samples, jitter):
 
-    D = mu_0.shape[0]
+    D = len(mu_0)
     mu_t = mu_0.clone()
     Sigma_t = Sigma_0.clone()
 
@@ -124,7 +124,7 @@ def batch_and_match_vi(T, B, mu_0, Sigma_0, y_observed, sigma_y_gt, n_mcmc_sampl
         g_z = torch.zeros(B, D) # (B, D)
         for idx in range(B):
             z_b = samples[idx]
-            g_b = score(z_b, sigma_y_gt, y_observed, n_mcmc_samples)
+            g_b = score(z_b, sigma_y_gt, y_observed, n_monte_carlo_samples)
             g_z[idx] = g_b
 
         lambda_t = T / (t + 1)
@@ -136,7 +136,7 @@ def batch_and_match_vi(T, B, mu_0, Sigma_0, y_observed, sigma_y_gt, n_mcmc_sampl
             mu_t, Sigma_t = mean_new, cov_new
         else:
             print("Bad update for covariance matrix. Revert")
-        if t % 1 == 0:
+        if t % 10 == 0:
             print(f"Iteration {t}:")
             print("mean:", mu_t)
             print("cov:", Sigma_t)
@@ -145,25 +145,76 @@ def batch_and_match_vi(T, B, mu_0, Sigma_0, y_observed, sigma_y_gt, n_mcmc_sampl
     return mu_t, Sigma_t
 
 
-def main():
-    torch.manual_seed(0)
-    n_samples = 100
-    mu_x_gt = torch.tensor(0.0)
-    sigma_x_gt = torch.tensor(1.0)
-    sigma_y_gt = torch.tensor(0.01)
+def mle_sigma_x2_and_std_known_sigma(y, mu_x, sigma_x, sigma_y):
+    """
+    Compute MLE of sigma_x^2 and its exact variance assuming sigma_x and sigma_y are known.
+
+    Returns:
+        sigma_x2_hat: MLE of sigma_x^2
+        var_of_estimate: exact variance of MLE
+    """
+    N = y.numel()
+
+    # Empirical moment about mu_x
+    s2 = torch.mean((y - mu_x)**2)
+
+    # MLE of sigma_x^2
+    sigma_x2_hat = torch.clamp(s2 - sigma_y**2, min=0.0)
+
+    # Exact variance of the MLE (sigma_x^2 + sigma_y^2 is known)
+    var_of_estimate = (2.0 / N) * (sigma_x**2 + sigma_y**2)**2
+
+    return sigma_x2_hat, var_of_estimate.sqrt()
+
+
+
+
+def run(n_samples, T, B,  n_monte_carlo_samples):
+    mu_x_gt = torch.tensor([0.0])
+    sigma_x_gt = torch.tensor([1.0])
+    sigma_y_gt = torch.tensor([0.01])
     _, y_observed = simulator(mu_x_gt, sigma_x_gt, sigma_y_gt, n_samples)
     d=1
-    mu_T, Sigma_T = batch_and_match_vi(T=100, 
-                                       B=100, 
-                                       mu_0=torch.zeros(d) - 0.1, 
-                                       Sigma_0=torch.eye(d) * 1.1,
+    mu_T, Sigma_T = batch_and_match_vi(T=T, 
+                                       B=B, 
+                                       mu_0=torch.log(sigma_x_gt * 2), 
+                                       Sigma_0=torch.eye(d)*3,
                                        y_observed=y_observed,
                                        sigma_y_gt=sigma_y_gt,
-                                       n_mcmc_samples=300,
+                                       n_monte_carlo_samples=n_monte_carlo_samples,
                                        jitter=1e-6
                                        )
     print("True mean:", sigma_x_gt)
-    print("Final mean: \n log_sigma_x", mu_T)
-    print(" sigma_x", mu_T.exp())
+    # print("Final mean: \n log_sigma_x", mu_T)
+    print("bam estimated sigma_x", mu_T.exp())
+    sigma_x2_hat, std_of_estimate = mle_sigma_x2_and_std_known_sigma(y_observed, mu_x_gt, sigma_x_gt, sigma_y_gt)
+    print("MLE estimate of sigma_x^2:", sigma_x2_hat)
+    print("std of MLE estimate of sigma_x^2:", std_of_estimate)
+    return mu_T.exp(), sigma_x2_hat, std_of_estimate
+
+def main():
+    torch.manual_seed(0)
+    T = 3
+    B = 30
+    n_monte_carlo_samples = 300
+    trials = 30
+    list_of_n_samples = [3, 10, 30, 100, 300, 1000]
+    bam_estimates_of_sigma_x = torch.zeros(trials, len(list_of_n_samples))
+    mle_estimates_of_sigma_x = torch.zeros(trials, len(list_of_n_samples))
+    std_estimates_of_sigma_x = torch.zeros(trials, len(list_of_n_samples))
+    for trial_idx in range(trials):
+        for n_sample_idx, n_samples in enumerate(list_of_n_samples):
+            print(f"Trial {trial_idx}, n_samples {n_samples}")
+            sigma_x_estimate, mle_estimate, std_of_estimate = run(n_samples, T, B, n_monte_carlo_samples)
+            bam_estimates_of_sigma_x[trial_idx, n_sample_idx] = sigma_x_estimate
+            mle_estimates_of_sigma_x[trial_idx, n_sample_idx] = mle_estimate
+            std_estimates_of_sigma_x[trial_idx, n_sample_idx] = std_of_estimate
+    torch.save({
+        "list_of_n_samples": list_of_n_samples,
+        "bam_estimates_of_sigma_x": bam_estimates_of_sigma_x,
+        "mle_estimates_of_sigma_x": mle_estimates_of_sigma_x,
+        "std_estimates_of_sigma_x": std_estimates_of_sigma_x,
+    }, "estimates_of_sigma_x.pt")
+
 if __name__ == "__main__":
     main()
